@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(c) 2010-2016 Intel Corporation
+ * Copyright(c) 2010-2021 Intel Corporation
  */
 
 #include <stdio.h>
@@ -17,6 +17,11 @@
 #include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <float.h>
+#include <math.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <rte_common.h>
 #include <rte_log.h>
@@ -40,6 +45,7 @@
 #include <rte_mbuf.h>
 #include <rte_string_fns.h>
 #include <rte_flow.h>
+
 
 static volatile bool force_quit;
 
@@ -107,24 +113,20 @@ static struct rte_eth_conf port_conf = {
 	},
 };
 
-struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
-
-/* Per-port statistics struct */
-struct l2fwd_port_statistics {
-	uint64_t tx;
-	uint64_t rx;
-	uint64_t dropped;
-        uint64_t yockgen;
-} __rte_cache_aligned;
-struct l2fwd_port_statistics port_statistics[RTE_MAX_ETHPORTS];
 
 #define MAX_TIMER_PERIOD 86400 /* 1 day max */
-
 /* A tsc-based timer responsible for triggering statistics printout */
-static uint64_t timer_period = 10; /* default period is 10 seconds */
+static uint64_t timer_period = 5; /* default period is 5 seconds */
 
-struct rte_flow *flow;
+/*  statistics struct */
+struct latency_stats {
+	int  median;
+	int  avg;
+        double stddev;
+        char pkt_type[20];
+} ltc_stats;
 
+struct rte_mempool * l2fwd_pktmbuf_pool = NULL;
 
 static void debug0(const char* format,...){
 
@@ -148,100 +150,6 @@ uint64_t get_time_nanosec(clockid_t clkid)
 }
 
 
-//yockgen:start
-
-
-
-
-//yockgen:end
-
-
-//rte_flow testing start
-
-static struct rte_flow *
-set_pkt_flow(uint16_t port_id, uint16_t rx_q,
-		uint32_t src_ip, uint32_t src_mask,
-		uint32_t dest_ip, uint32_t dest_mask,
-		struct rte_flow_error *error)
-{
-
-#define MAX_PATTERN_NUM		3
-#define MAX_ACTION_NUM		2
-
-	struct rte_flow_attr attr;
-	struct rte_flow_item pattern[MAX_PATTERN_NUM];
-	struct rte_flow_action action[MAX_ACTION_NUM];
-	struct rte_flow *flow = NULL;
-	struct rte_flow_action_queue queue = { .index = rx_q };
-	struct rte_flow_item_ipv4 ip_spec;
-	struct rte_flow_item_ipv4 ip_mask;
-	int res;
-
-	memset(pattern, 0, sizeof(pattern));
-	memset(action, 0, sizeof(action));
-
-	/*
-	 * set the rule attribute.
-	 * in this case only ingress packets will be checked.
-	 */
-	memset(&attr, 0, sizeof(struct rte_flow_attr));
-	attr.ingress = 1;
-
-	/*
-	 * create the action sequence.
-	 * one action only,  move packet to queue
-	 */
-	action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
-	action[0].conf = &queue;
-	action[1].type = RTE_FLOW_ACTION_TYPE_END;
-
-	/*
-	 * set the first level of the pattern (ETH).
-	 * since in this example we just want to get the
-	 * ipv4 we set this level to allow all.
-	 */ 
-	pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
- 
-	/*
-	 * setting the second level of the pattern (IP).
-	 * in this example this is the level we care about
-	 * so we set it according to the parameters.
-	 */
-	memset(&ip_spec, 0, sizeof(struct rte_flow_item_ipv4));
-	memset(&ip_mask, 0, sizeof(struct rte_flow_item_ipv4));
-	ip_spec.hdr.dst_addr = htonl(dest_ip);
-	ip_mask.hdr.dst_addr = dest_mask;
-	ip_spec.hdr.src_addr = htonl(src_ip);
-	ip_mask.hdr.src_addr = src_mask;
-        pattern[1].type= RTE_FLOW_ITEM_TYPE_IPV4;
-	pattern[1].spec = &ip_spec;
-	pattern[1].mask = &ip_mask;
-
-	/* the final level must be always type end */
-	pattern[2].type = RTE_FLOW_ITEM_TYPE_END;
-
-
-       /* only protocol is used */
-        const struct rte_flow_item_ipv4 *mask = pattern[1].mask;
-	if (mask->hdr.dst_addr){
-
-		printf("\nIPv4 only support protocol\n");
-       }
-
-
-	res = rte_flow_validate(port_id, &attr, pattern, action, error);
-	if (!res){
-	        printf("\n\ncalled!!\n\n");  
-        	flow = rte_flow_create(port_id, &attr, pattern, action, error);
-        } else {printf("\n\nerror flow creation!!\n\n");  }
-
-
-	return flow;
-}
-
-//rte_flow_testing end
-
-
 static uint64_t get_time_nanosec_hwtsp(int port)
 {
 
@@ -251,11 +159,13 @@ static uint64_t get_time_nanosec_hwtsp(int port)
 
 }
 
-static int iCnt = 0; 
-static int pCnt = 0;
-static void extract_l2packet(struct rte_mbuf *m, int rx_batch_idx, int rx_batch_ttl, FILE *fp)
-{
+#define MX_PKT_RCV 6000000
+static  volatile int iCnt = 0; 
+static  volatile int  pCnt = 0;
+static  uint64_t a_latency[MX_PKT_RCV]; 
 
+static int  extract_l2packet(struct rte_mbuf *m, int rx_batch_idx, int rx_batch_ttl, FILE *fp,unsigned lcore_id)
+{
 
 #define TALKER_PACKET_ETH_TYPE 2048
 
@@ -266,11 +176,7 @@ static void extract_l2packet(struct rte_mbuf *m, int rx_batch_idx, int rx_batch_
        struct rte_ether_addr src01 =  eth_hdr->s_addr;
        struct rte_ether_addr dst01 =  eth_hdr->d_addr;
 
-
-       if (eth_hdr->ether_type != TALKER_PACKET_ETH_TYPE) {
-            //return; 
-       }
-
+       //ignore packet content processing not to local machine
        if (l2fwd_ports_eth_addr[0].addr_bytes[0] != dst01.addr_bytes[0] ||
            l2fwd_ports_eth_addr[0].addr_bytes[1] != dst01.addr_bytes[1] ||
            l2fwd_ports_eth_addr[0].addr_bytes[2] != dst01.addr_bytes[2] ||
@@ -278,15 +184,24 @@ static void extract_l2packet(struct rte_mbuf *m, int rx_batch_idx, int rx_batch_
            l2fwd_ports_eth_addr[0].addr_bytes[4] != dst01.addr_bytes[4] ||
            l2fwd_ports_eth_addr[0].addr_bytes[5] != dst01.addr_bytes[5]
           ){
-            return;
+            return 0;
  
        }
 
+        char pkt_std[] = "IEEE802.3 Standard";
+        char pkt_vlan[] = "IEEE802.1q VLAN";
+        char pkt_unknown[] = "unknown";
+        if (rte_cpu_to_be_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_IPV4)
+            strncpy(ltc_stats.pkt_type, pkt_std, sizeof(pkt_std));
+        else if (rte_cpu_to_be_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_VLAN)
+            strncpy(ltc_stats.pkt_type, pkt_vlan, sizeof(pkt_vlan));
+        else
+            strncpy(ltc_stats.pkt_type, pkt_unknown, sizeof(pkt_unknown));
 
         //fprintf (stdout,"\n------------------------------------------");
         debug0("\n------------------------------------------");
         debug0("\nbatch: %d of %d",rx_batch_idx,rx_batch_ttl);
-        debug0("\nether_type=%d",eth_hdr->ether_type);
+        debug0("\nether_type=%"PRIu64,eth_hdr->ether_type);
         debug0("\nPayload Data Size=%d",datalen);
 
         debug0("\nSOURCE MAC address: %02X:%02X:%02X:%02X:%02X:%02X",
@@ -324,48 +239,58 @@ static void extract_l2packet(struct rte_mbuf *m, int rx_batch_idx, int rx_batch_
 
 
         char b_tx_tsp[20];
-        int i,j;
-        for(j=4,i=0;j<24;j++,i++){
-           b_tx_tsp[i] = msg[j];
+        int i=0,j=0;
+        int i_start_idx = eth_hdr->ether_type==129 ? 4: 0;
+        for(j=i_start_idx,i=0;j<24;j++,i++){
+          if (i>=0 && i < sizeof(b_tx_tsp)/sizeof(b_tx_tsp[0]))  
+              b_tx_tsp[i] = msg[j];
         }
 
         fprintf(fp,"%d,", 0);
-
-        /*for(i=0;j<24;i++){
-           b_tx_tsp[i] = msg[i];
-        }*/
-
-
-
+        
 	uint64_t now_tsp  = get_time_nanosec(CLOCK_REALTIME);
-        //uint64_t now_tsp  =  get_time_nanosec_hwtsp(0);
 
         uint64_t tx_tsp;
-        sscanf(b_tx_tsp, "%"PRIu64, &tx_tsp);
+        sscanf(b_tx_tsp, "%"PRIu64, &tx_tsp);        
+        if (tx_tsp<0 || tx_tsp> UINT64_MAX) {
+            printf ("\nAbnormal tx_tsp for %d, reset to 0",iCnt); 
+            tx_tsp = 0;
+        }        
         uint64_t delta_val = now_tsp - tx_tsp;
 
         debug0("\ntx_tsp:%"PRIu64,tx_tsp);
         debug0("\nnw_tsp:%"PRIu64,now_tsp);
         debug0("\nlatency(ns):%"PRIu64,delta_val);
-        debug0("\nidx:");
+        debug0("\nraw:");
 
         fprintf(fp,"%"PRIu64,delta_val);
         pCnt++;
         fprintf(fp,",%d\n", pCnt);
 
-        //for (j=24; j <34; j++){
-        for (j=0; j <100; j++){
-           if (isdigit(msg[j]))
-              debug0("%c",msg[j]);
+
+
+        for (j=0; j <100; j++)
+        {
+            //if (isdigit(msg[j]))
+                debug0("%c",msg[j]);
+
         }
 
         debug0("\n");
-        iCnt++;
 
-        if (is_debug==0){
-              printf("\r                ");
-              printf("\rPacket received: %d",iCnt);
+
+        if (delta_val>=0 && delta_val< INT_MAX) //sanity check 
+             a_latency[iCnt] = delta_val;     
+        
+        else {
+          a_latency[iCnt] = -1; //error
+          debug0 ("\nERR IDX=%d LATENCY:%d", iCnt,delta_val);
         }
+
+
+        iCnt++;        
+        
+        return 1;
 
 }
 
@@ -402,23 +327,35 @@ l2fwd_mac_updating(struct rte_mbuf *m, unsigned dest_portid)
 	rte_ether_addr_copy(&l2fwd_ports_eth_addr[dest_portid], &eth->s_addr);
 }
 
-static void
-l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid)
+static int
+l2fwd_simple_forward(struct rte_mbuf *m, unsigned portid, unsigned to_local)
 {
 	unsigned dst_port;
 	int sent;
 	struct rte_eth_dev_tx_buffer *buffer;
 
 
+	if (to_local >0){
+   	    rte_pktmbuf_free(m);
+            return 0;
+        }
+
 	dst_port = l2fwd_dst_ports[portid];
-        
-	if (mac_updating)
-		l2fwd_mac_updating(m, dst_port);
+
+        if (mac_updating){
+	    l2fwd_mac_updating(m, dst_port);
+        }
 
 	buffer = tx_buffer[dst_port];
-	sent = rte_eth_tx_buffer(dst_port, 0, buffer, m);
-	if (sent)
-		port_statistics[dst_port].tx += sent;
+ 
+        sent = rte_eth_tx_buffer(dst_port, 0, buffer, m);
+
+        return sent;
+}
+
+int sort_compare (const void * a, const void * b)
+{
+  return ( *(int*)a - *(int*)b );
 }
 
 /* main processing loop */
@@ -436,9 +373,7 @@ l2fwd_main_loop(void)
 			BURST_TX_DRAIN_US;
 	struct rte_eth_dev_tx_buffer *buffer;
 
-	FILE *fp;
-	fp = fopen(output_file, "a+");
-
+	
 	prev_tsc = 0;
 	timer_tsc = 0;
 
@@ -459,33 +394,36 @@ l2fwd_main_loop(void)
 			portid);
 
 	}
-
+ 
+        int i_clean = 0;
+               
+        FILE* fp = fopen(output_file,"w");        
+	if (!fp)	
+		rte_exit(EXIT_FAILURE, "Cannot open output_file:%s\n", output_file);	
+        
 	while (!force_quit) {
 
-                fflush(stdout);
-		cur_tsc = rte_rdtsc();
-
-		/*
-		 * TX burst queue drain
-		 */
-		diff_tsc = cur_tsc - prev_tsc;
-		if (unlikely(diff_tsc > drain_tsc)) {
-
-			for (i = 0; i < qconf->n_rx_port; i++) {
-
-				portid = l2fwd_dst_ports[qconf->rx_port_list[i]];
-				buffer = tx_buffer[portid];
-
-				sent = rte_eth_tx_buffer_flush(portid, 0, buffer);
-				if (sent)
-					port_statistics[portid].tx += sent;
-
-			}
-
-
-		       prev_tsc = cur_tsc;
-		}
-
+                //this is a timer control mechanism to refresh screen under non-debug mode
+                //arbitrary run printf in every cycle will caused intermitently hang                
+                cur_tsc = rte_rdtsc();
+                diff_tsc = cur_tsc - prev_tsc;
+                if (unlikely(diff_tsc > drain_tsc)) {
+                    if (timer_period > 0) {
+                        timer_tsc += diff_tsc;
+                        if (unlikely(timer_tsc >= timer_period)) {
+                                if (lcore_id == rte_get_main_lcore()) {
+                                   if (is_debug==0){                                     
+                                     fflush(stdout);
+                                     printf("\r                ");
+                                     printf("\rPacket received: %ld",iCnt);	
+                                   }
+                                   timer_tsc = 0;
+                                }
+                        }
+                    }
+                    prev_tsc = cur_tsc;
+                }                
+		
 		/*
 		 * Read packet from RX queues
 		 */
@@ -494,57 +432,76 @@ l2fwd_main_loop(void)
 
 			portid = qconf->rx_port_list[i];
 			nb_rx = rte_eth_rx_burst(portid, 0,
-						 pkts_burst, MAX_PKT_BURST);
+						 pkts_burst,MAX_PKT_BURST);
 
-			port_statistics[portid].rx += nb_rx;
- 
-                        int datalen = 0; 
+                        int datalen = 0,nb_tx=0,to_local=0;
+
 			for (j = 0; j < nb_rx; j++) {
 
-				m = pkts_burst[j]; //change back to variable!!!!!!
-				//rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+				m = pkts_burst[j];
                                 datalen = rte_pktmbuf_pkt_len(m);
-                                extract_l2packet(m,j+1,nb_rx,fp);
-
-//yockgen: troubleshooting
-//printf("\nj=pkts_burst[%d] nb_rx=%d\n",j,nb_rx);
-/*struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-       char* msg = ((rte_pktmbuf_mtod(m,char*)) + sizeof(struct rte_ether_hdr)); //maybe wrong
-       int datalen = rte_pktmbuf_pkt_len(m);  
-       struct rte_ether_addr src01 =  eth_hdr->s_addr;
-       struct rte_ether_addr dst01 =  eth_hdr->d_addr;
-
- char b_tx_tsp[20]; 
-        int j;
-        for(j=0;j<20;j++){
-           b_tx_tsp[j] = msg[j]; 
-	   printf("%c",msg[j]);
-        }
-        printf("\n");*/
-//end troubleshooting
-
-
-				/*m = pkts_burst[1]; //change back to variable!!!!!!
-				rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-                                datalen = rte_pktmbuf_pkt_len(m);
-                                extract_l2packet(m,j+1,nb_rx); 
-
-
-				m = pkts_burst[2]; //change back to variable!!!!!!
-				rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-                                datalen = rte_pktmbuf_pkt_len(m);
-                                extract_l2packet(m,j+1,nb_rx); */
-
-
-                                l2fwd_simple_forward(m, portid);
-
-
+                                to_local = extract_l2packet(m,j+1,nb_rx,fp,lcore_id);
+			        nb_tx  = l2fwd_simple_forward(m, portid,to_local);
 			}
 
+
 		}
+
+                usleep(2);
+
 	}
 
         fclose(fp);
+
+        if (iCnt>2){
+ 
+            uint64_t sum=0,avg=0;
+            int iActualCnt=0, iStartCnt=0;
+
+            //ignore first 10 percent data as yet stablized  
+            if(iCnt>100){
+               iStartCnt = iCnt * 0.1;
+            }
+            for (int i=iStartCnt;i<iCnt;i++){
+               if (a_latency[i]>=0 && sum < FLT_MAX){
+                 sum += (a_latency[i]/1000); //normalized the latency to avoid big number overflow
+                 iActualCnt++;
+               }
+
+               if (sum>FLT_MAX-1){
+                         break;
+               } 
+            }
+
+	    if (iActualCnt)
+                ltc_stats.avg = sum/iActualCnt*1000;
+
+
+            //standard deviation 
+            long stdsum  = 0, variance=0;
+            int  iTmp=0;
+            double stddev = 0;
+            iActualCnt = 0; 
+            for (int i=iStartCnt;i<iCnt;i++){
+               if (a_latency[i]>=0 && stdsum <= LLONG_MAX){
+                 iTmp =  (a_latency[i]/1000); //normalized the latency to avoid big number overflow 
+                 stdsum += pow(iTmp,1);
+                 iActualCnt++;
+               }
+               if (stdsum>=LLONG_MAX) break;
+            }
+	    if (iActualCnt)
+                variance = stdsum / iActualCnt;
+            if (variance >0)stddev = sqrt(variance) * 1000;
+            ltc_stats.stddev = stddev;
+
+            //get median, this need to at last step else the order of data will be sorted to value
+            qsort (a_latency, iCnt, sizeof(uint64_t), sort_compare);
+            ltc_stats.median = a_latency[iCnt/2];
+
+
+        }
+
 }
 
 
@@ -563,8 +520,8 @@ l2fwd_usage(const char *prgname)
 	printf("%s [EAL options] -- -p PORTMASK [-q NQ]\n"
 	       "  -p PORTMASK: hexadecimal bitmask of ports to configure\n"
 	       "  -q NQ: number of queue (=ports) per lcore (default is 1)\n"
-	       "  -T PERIOD: statistics will be refreshed each PERIOD seconds (0 to disable, 10 default, 86400 maximum)\n"
-	       "  -f FILENAME: File name length should be less than 30 characters, preferably with .csv extension\n"
+	       "  -f LATENCY OUTPUT FILENAME: length should be less than 30 characters, preferably with .csv extension. Default is 'default_listenerOPfile.csv' if option not provided\n"
+               "  -D [1,0] (1 to enable debug mode, 0 default disable debug mode)\n" 
 	       "  --[no-]mac-updating: Enable or disable MAC addresses updating (enabled by default)\n"
 	       "      When enabled:\n"
 	       "       - The source MAC address is replaced by the TX port MAC address\n"
@@ -616,7 +573,7 @@ l2fwd_parse_port_pair_config(const char *q_arg)
 		if (size >= sizeof(s))
 			return -1;
 
-		memcpy(s, p, size);
+		rte_memcpy(s, p, size);
 		s[size] = '\0';
 		if (rte_strsplit(s, sizeof(s), str_fld,
 				 _NUM_FLD, ',') != _NUM_FLD)
@@ -680,14 +637,15 @@ l2fwd_parse_timer_period(const char *q_arg)
 static int
 l2fwd_parse_output_file(const char *q_arg)
 {
-	int file_length = 0;
-	file_length = strlen(q_arg);
-	if (file_length > 30)
-		return 0;
-	else
-	{
-		strcpy(output_file, q_arg);
+	
+	if (strlen(q_arg) > 0 && strlen(q_arg) <=  sizeof(output_file)/sizeof(output_file[0]))
+        {
+		strlcpy(output_file, q_arg,sizeof(output_file));                
 		return 1;
+        }
+	else
+	{              
+		return 0;
 	}
 }
 
@@ -917,7 +875,6 @@ check_all_ports_link_status(uint32_t port_mask)
 		/* set the print_flag if all ports up or timeout */
 		if (all_ports_up == 1 || count == (MAX_CHECK_TIME - 1)) {
 			print_flag = 1;
-			printf("done\n");
 		}
 	}
 }
@@ -932,9 +889,11 @@ signal_handler(int signum)
 	}
 }
 
+
 int
 main(int argc, char **argv)
 {
+
 	struct lcore_queue_conf *qconf;
 	int ret;
 	uint16_t nb_ports;
@@ -944,6 +903,7 @@ main(int argc, char **argv)
 	unsigned nb_ports_in_mask = 0;
 	unsigned int nb_lcores = 0;
 	unsigned int nb_mbufs;
+        struct rte_eth_stats eth_stats;
 
 	/* init EAL */
 	ret = rte_eal_init(argc, argv);
@@ -1081,35 +1041,18 @@ main(int argc, char **argv)
 				"Error during getting device (port %u) info: %s\n",
 				portid, strerror(-ret));
 
-
-//yockgen test: start
-
-                if (!(dev_info.rx_offload_capa & DEV_RX_OFFLOAD_TIMESTAMP)) {
-			printf("\nERROR: Port %u does not support hardware timestamping\n", portid);
-		}
-
-                /*int hwts_dynfield_offset = -1;
-                local_port_conf.rxmode.offloads |= DEV_RX_OFFLOAD_TIMESTAMP;
-		rte_mbuf_dyn_rx_timestamp_register(&hwts_dynfield_offset, NULL);
-                printf("\nhwts_dynfield=%d\n",hwts_dynfield_offset);
-		if (hwts_dynfield_offset < 0) {
-			printf("\nERROR: Failed to register timestamp field\n");
-			//return -rte_errno;
-		}*/
-
                 if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE)
 			local_port_conf.txmode.offloads |= DEV_TX_OFFLOAD_MBUF_FAST_FREE;
+
+                printf("\nDriver=%s",dev_info.driver_name);
+                printf("\nmax_rx_queues=%d",dev_info.max_rx_queues);
+                printf("\nmax_tx_queues=%d\n",dev_info.max_tx_queues);
 
 		ret = rte_eth_dev_configure(portid, 1, 1, &local_port_conf);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%u\n",
 				  ret, portid);
 
-
-printf("\ndriver=%s",dev_info.driver_name);
-printf("\nmax_rx_queues=%d",dev_info.max_rx_queues);
-
-//yockgen:end
 
 		ret = rte_eth_dev_adjust_nb_rx_tx_desc(portid, &nb_rxd,
 						       &nb_txd);
@@ -1159,8 +1102,8 @@ printf("\nmax_rx_queues=%d",dev_info.max_rx_queues);
 		rte_eth_tx_buffer_init(tx_buffer[portid], MAX_PKT_BURST);
 
 		ret = rte_eth_tx_buffer_set_err_callback(tx_buffer[portid],
-				rte_eth_tx_buffer_count_callback,
-				&port_statistics[portid].dropped);
+				rte_eth_tx_buffer_count_callback,NULL);
+				//&port_statistics[portid].dropped);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE,
 			"Cannot set error callback for tx buffer on port %u\n",
@@ -1177,8 +1120,7 @@ printf("\nmax_rx_queues=%d",dev_info.max_rx_queues);
 			rte_exit(EXIT_FAILURE, "rte_eth_dev_start:err=%d, port=%u\n",
 				  ret, portid);
 
-		printf("done: \n");
-
+		
 		ret = rte_eth_promiscuous_enable(portid);
 		if (ret != 0)
 			rte_exit(EXIT_FAILURE,
@@ -1194,8 +1136,6 @@ printf("\nmax_rx_queues=%d",dev_info.max_rx_queues);
 				l2fwd_ports_eth_addr[portid].addr_bytes[4],
 				l2fwd_ports_eth_addr[portid].addr_bytes[5]);
 
-		/* initialize port stats */
-		memset(&port_statistics, 0, sizeof(port_statistics));
 	}
 
 	if (!nb_ports_available) {
@@ -1204,27 +1144,6 @@ printf("\nmax_rx_queues=%d",dev_info.max_rx_queues);
 	}
 
 	check_all_ports_link_status(l2fwd_enabled_port_mask);
-
-//yockgen: rte_flow testing
-
-#define SRC_IP ((0<<24) + (0<<16) + (0<<8) + 0) /* src ip = 0.0.0.0 */
-#define DEST_IP ((10<<24) + (158<<16) + (78<<8) + 178) /* dest ip = 10.158.78.178 */
-#define FULL_MASK 0xffffffff /* full mask */
-#define EMPTY_MASK 0x0 /* empty mask */
-
-        struct rte_flow_error error;
-
-	flow = set_pkt_flow(0, 0,SRC_IP, EMPTY_MASK, DEST_IP, FULL_MASK, &error);
-	if (!flow) {
-		printf("Flow can't be created %d message: %s\n",
-			error.type,
-			error.message ? error.message : "(no stated reason)");
-		//rte_exit(EXIT_FAILURE, "error in creating flow\n");
-	}
-
-//yockgen:end
-
-
 
 	ret = 0;
 	/* launch per-lcore init on every lcore */
@@ -1241,17 +1160,48 @@ printf("\nmax_rx_queues=%d",dev_info.max_rx_queues);
 	RTE_ETH_FOREACH_DEV(portid) {
 		if ((l2fwd_enabled_port_mask & (1 << portid)) == 0)
 			continue;
-		printf("Closing port %d...", portid);
+
+                rte_eth_stats_get(portid, &eth_stats);
+                printf("\nStatistics for port %u\n------------------------------"
+                           "\nPacket type: %s"
+			   "\nPackets sent: %"PRIu64
+			   "\nPackets sent (bytes): %"PRIu64
+			   "\nPackets sent dropped: %"PRIu64
+			   "\nPackets received: %"PRIu64
+			   "\nPackets received (bytes): %"PRIu64
+			   "\nPackets received dropped (no RX buffer) : %"PRIu64
+			   "\nPackets received dropped (other errors) : %"PRIu64, 
+			   portid,
+                           ltc_stats.pkt_type,
+			   eth_stats.opackets,
+                           eth_stats.obytes,
+                           eth_stats.oerrors,
+			   eth_stats.ipackets,
+                           eth_stats.ibytes,
+                           eth_stats.imissed,
+                           eth_stats.ierrors);
+
+               printf("\nSummary Statistics\n------------------------------\n"
+               	"Packet type: %s\n"
+	       	"Median of %d packets latency in nanoseconds  (ns):%d\n"
+	       	"Average of %d packets latency in nanoseconds (ns):%d\n"
+	       	"Standard deviation of %d packets latency in nanoseconds (ns):%lf\n\n",
+                	 ltc_stats.pkt_type,
+		 	iCnt,ltc_stats.median
+			,iCnt,ltc_stats.avg
+			,iCnt,ltc_stats.stddev);
+
+
+
+		printf("\n\nClosing port %d...\n", portid);
 		ret = rte_eth_dev_stop(portid);
 		if (ret != 0)
 			printf("rte_eth_dev_stop: err=%d, port=%d\n",
 			       ret, portid);
 		rte_eth_dev_close(portid);
-		printf(" Done\n");
 	}
-	printf("Bye...\n");
+         
 
-        printf("\nttl pkt rtx = %d\n",iCnt);
-
+        
 	return ret;
 }
